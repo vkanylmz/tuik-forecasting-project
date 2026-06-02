@@ -46,13 +46,11 @@ dir.create("outputs/figures", recursive = TRUE, showWarnings = FALSE)
 
 # Project Overview
 
-This project develops an R-based forecasting analysis using a time series data set obtained from the TÜİK Data Portal. The selected data set is **Number of Trips and Overnights of Domestic Visitors by Quarter**, under the **Tourism** theme. The selected variable is **Number of Trips**.
-
-The purpose of the analysis is to compare alternative forecasting methods and forecast the next unpublished period after the latest available TÜİK observation.
+This project applies ten forecasting methods to the **Number of Trips** variable from the TÜİK quarterly domestic tourism series. The aim is to compare how well each method captures the historical pattern and to produce a point forecast for 2026 Q1, which was not yet published at the time of data access.
 
 # Data Source and TÜİK Connection
 
-The data are accessed directly from TÜİK through R. The table is first located using the `tuikr` package. Since the selected table is an `istab` table and does not have a `TR,DF_...` dataflow ID, the official TÜİK `table_url` returned by `tuikr::statistical_tables(theme = "14")` is used within R.
+The data come from TÜİK's quarterly domestic tourism table, accessed entirely within R. The table belongs to the `istab` node type and does not carry a `TR,DF_...` dataflow ID, so it cannot be retrieved via the standard dataflow route. Instead, `tuikr::statistical_tables(theme = "14")` is used to locate the table and extract its official `table_url`, which is then fetched directly with `httr::GET()`.
 
 ```{r import-data}
 data_import <- import_domestic_tourism_data()
@@ -105,13 +103,13 @@ kable(source_summary)
 
 # Use of TÜİK Data in R
 
-The data were not manually downloaded, copied, pasted, edited, or stored as a separate input data file. The workflow is fully reproducible inside R:
+No data file was manually downloaded, saved, or edited at any point. The full pipeline runs inside R:
 
-1. The table list is obtained with `tuikr::statistical_tables(theme = "14")`.
-2. The table named **Number of Trips and Overnights of Domestic Visitors by Quarter** is selected.
-3. The official TÜİK `table_url` is requested with `httr::GET()` inside R.
-4. The returned Excel content is read with `readxl::read_excel()`.
-5. Quarterly rows are selected and formatted into a time series using reproducible R code.
+1. `tuikr::statistical_tables(theme = "14")` retrieves the list of Tourism tables.
+2. The row matching **Number of Trips and Overnights of Domestic Visitors by Quarter** is selected.
+3. The official `table_url` is fetched with `httr::GET()`.
+4. The returned Excel file is read with `readxl::read_excel()`.
+5. Quarterly rows are identified by their Roman numeral quarter labels (I–IV) and assembled into a clean time series.
 
 ```{r data-preview}
 head(domestic_data) %>% kable()
@@ -145,7 +143,7 @@ actual_plot
 ggsave("outputs/figures/actual_series_plot.png", actual_plot, width = 9, height = 5, dpi = 300)
 ```
 
-The series is quarterly and exhibits a recurring seasonal pattern across quarters. The third quarter generally records higher values, reflecting the seasonal nature of domestic tourism activity in Türkiye. The series also shows structural variation during the pandemic period, which may influence forecasting performance.
+The series runs from 2009 Q1 through 2025 Q4 and has a pronounced seasonal cycle. Q3 is consistently the peak quarter — summer travel dominates domestic tourism in Türkiye — while Q1 records the lowest values. The overall level grew steadily through the 2010s before collapsing sharply in 2020 and recovering from 2022 onward. This pandemic break is the most significant feature of the series and complicates any method that relies on long-run averages or a single fitted trend.
 
 # Forecasting Methods
 
@@ -172,7 +170,7 @@ save_actual_forecast_plot(
 
 ## Moving Average
 
-A four-quarter moving average is used because the data are quarterly and one full seasonal cycle contains four quarters.
+A four-quarter moving average is used to match one full seasonal cycle. Using fewer quarters would mix observations from different seasonal positions; using more would dilute recent levels.
 
 ```{r moving-average}
 next_forecasts %>% filter(Method == "Moving Average") %>% kable()
@@ -186,7 +184,7 @@ save_actual_forecast_plot(
 
 ## Weighted Moving Average
 
-The weighted moving average gives more importance to recent observations. The weights are 0.40, 0.30, 0.20, and 0.10 for the most recent four quarters.
+The weighted moving average assigns heavier weight to the most recent quarter (0.40) and progressively less to earlier ones (0.30, 0.20, 0.10), on the assumption that recent observations are more informative about the current level.
 
 ```{r weighted-moving-average}
 next_forecasts %>% filter(Method == "Weighted Moving Average") %>% kable()
@@ -200,7 +198,7 @@ save_actual_forecast_plot(
 
 ## Exponential Smoothing
 
-Simple exponential smoothing is applied as a baseline non-seasonal smoothing method.
+Simple exponential smoothing is included as a non-seasonal baseline. It adapts to level changes but ignores both trend and seasonality, so it is expected to underperform the decomposition methods on this series.
 
 ```{r exponential-smoothing}
 summary(forecast_results$ses_fit)
@@ -215,7 +213,7 @@ save_actual_forecast_plot(
 
 ## Trend-Adjusted Exponential Smoothing
 
-Holt's trend-adjusted exponential smoothing is applied because the series may contain changing levels and trend-like movements over time.
+Holt's method extends simple smoothing by also tracking a trend component. Given the upward drift visible in the pre-pandemic portion of the series, this extension is worth including, though the pandemic break makes a single estimated trend unreliable over the full sample.
 
 ```{r holt}
 summary(forecast_results$holt_fit)
@@ -230,7 +228,7 @@ save_actual_forecast_plot(
 
 ## Linear Trend Projection
 
-A linear trend model is estimated using a sequential time index.
+A linear trend is fitted using a sequential time index. This is the simplest parametric trend model and serves as a reference point for the more flexible seasonal methods below.
 
 ```{r linear-trend}
 summary(forecast_results$trend_model)
@@ -245,7 +243,7 @@ save_actual_forecast_plot(
 
 # Seasonal Methods and Decomposition
 
-Because the data are quarterly, seasonal methods are applicable. The quarters represent a recurring seasonal structure.
+The quarterly structure of the series makes seasonal methods directly applicable. The four quarters map onto a clear recurring cycle, so methods that explicitly model the seasonal component should outperform those that ignore it.
 
 ## Seasonal Indices
 
@@ -311,7 +309,7 @@ save_actual_forecast_plot(
 
 # Forecast Accuracy Comparison
 
-The comparison includes Bias, MAD, MSE, MAPE, RSFE, and Tracking Signal. Forecast error is defined as actual minus forecast.
+Each method's fitted values are compared against the actual series using six measures. Bias and RSFE indicate whether errors are systematically positive or negative. MAD and MSE penalise large errors (MSE more heavily). MAPE expresses average error as a percentage of the actual value, making it easier to compare across methods. The Tracking Signal flags whether cumulative errors are drifting in one direction.
 
 ```{r accuracy-comparison}
 method_columns <- c(
@@ -340,7 +338,9 @@ accuracy_table %>% kable(digits = 2)
 
 # Superior Method Selection
 
-The superior method is selected primarily based on MAPE (Mean Absolute Percentage Error), while also considering the suitability of the method for a quarterly seasonal time series. Among the evaluated methods, Additive Decomposition achieved the lowest MAPE and was therefore selected as the superior forecasting method. Tracking Signal is also considered as a monitoring measure for systematic bias.
+The primary selection criterion is MAPE, which is scale-independent and easy to interpret. Methods with non-finite MAPE or Tracking Signal values are excluded. Among the remaining candidates, the method with the lowest MAPE is selected; the Tracking Signal is used as a secondary check for systematic bias.
+
+The accuracy table confirms that the four seasonal methods outperform all non-seasonal ones by a wide margin. Additive Decomposition achieves the lowest MAPE at 9.49%, narrowly ahead of Multiplicative Decomposition at 9.89%. The additive specification is preferred here because the seasonal swings in the series do not appear to scale proportionally with the trend level — the amplitude of the seasonal pattern remains roughly stable over time rather than widening as the series grows.
 
 ```{r superior-method}
 applicable_methods <- accuracy_table %>%
@@ -354,7 +354,7 @@ superior <- applicable_methods %>%
 superior %>% kable(digits = 2)
 ```
 
-The selected method is superior for this TÜİK time series because it performs well in the numerical accuracy comparison and is appropriate for the observed quarterly structure of the data.
+The Tracking Signal of 0.57 is well within the ±4 control limit, which means the method is not producing systematic over- or under-forecasts.
 
 # Final Next-Period Forecast
 
@@ -406,25 +406,18 @@ ggsave("outputs/figures/superior_method_plot.png", p_superior, width = 9, height
 
 # Interpretation of Results
 
-The final forecast estimates the number of domestic tourism trips for the next unpublished quarterly period. The result should be interpreted as a quantitative forecast based only on the historical TÜİK time series. It does not include explanatory variables such as household income, inflation, transport costs, holidays, exchange rates, or policy changes.
+The Additive Decomposition forecast places 2026 Q1 trips at approximately **11,603**. This is broadly consistent with historical Q1 values following the post-pandemic recovery: the series returned to near pre-pandemic Q1 levels by 2023–2024, and the forecast implies a continuation of that range rather than a sharp departure.
+
+The estimate should be read as a purely statistical projection based on the historical TÜİK series. It does not reflect any information about booking trends, macroeconomic conditions, transport costs, or policy changes that may affect actual Q1 2026 outcomes.
 
 # Limitations
 
-The main limitations are:
-
-- The models use only past values of the selected TÜİK series.
-- Future shocks, policy changes, holidays, macroeconomic conditions, and tourism behavior changes are not explicitly modeled.
-- The pandemic period creates a structural break that may affect forecast accuracy.
-- Tracking Signal values should be interpreted carefully because systematic bias may appear after large shocks or sharp seasonal changes.
-- TÜİK data may be revised in later releases.
+All ten methods are univariate — they extrapolate from the past values of this single series and cannot anticipate external shocks. The most consequential limitation is the 2020–2021 structural break: any method fitted over the full sample has to reconcile two very different regimes, which inflates in-sample errors and makes the estimated seasonal pattern less reliable. A rolling-window or post-2022 estimation might reduce this problem but would sacrifice most of the available data. Additionally, TÜİK may revise earlier observations in future releases, which would alter the accuracy measures retrospectively.
 
 # Reproducibility Notes
 
-To reproduce the project:
+1. Install the R packages listed in the setup chunk.
+2. Open `forecasting_project.Rmd` and knit to HTML.
+3. The script will fetch the TÜİK table directly from the official URL — no external data file is needed.
 
-1. Install the required R packages listed in the setup chunk.
-2. Open `forecasting_project.Rmd`.
-3. Knit the file to HTML.
-4. The notebook will access the TÜİK table through `tuikr::statistical_tables(theme = "14")`, download the official TÜİK table URL inside R, clean the data, run the forecasting methods, and generate output tables and figures.
-
-No manually downloaded or manually edited data file is required.
+The `renv.lock` file records the exact package versions used, so `renv::restore()` can be used to recreate the same library state.
