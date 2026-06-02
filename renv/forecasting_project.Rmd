@@ -1,0 +1,423 @@
+---
+title: "TÜİK Forecasting Project: Number of Trips and Overnights of Domestic Visitors by Quarter"
+author: "Volkan Yılmaz | 138722026"
+date: "2026-05-31"
+output:
+  html_document:
+    toc: true
+    toc_depth: 3
+    number_sections: true
+    self_contained: true
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE)
+
+required_packages <- c(
+  "tuikr", "httr", "readxl", "dplyr", "readr", "tibble",
+  "forecast", "zoo", "ggplot2", "knitr", "scales"
+)
+
+missing_packages <- required_packages[!required_packages %in% rownames(installed.packages())]
+if (length(missing_packages) > 0) {
+  stop(paste("Please install missing packages before knitting:", paste(missing_packages, collapse = ", ")))
+}
+
+library(tuikr)
+library(httr)
+library(readxl)
+library(dplyr)
+library(readr)
+library(tibble)
+library(forecast)
+library(zoo)
+library(ggplot2)
+library(knitr)
+library(scales)
+
+source("R/data_import.R")
+source("R/forecasting_methods.R")
+source("R/accuracy_measures.R")
+source("R/plots.R")
+
+dir.create("outputs/tables", recursive = TRUE, showWarnings = FALSE)
+dir.create("outputs/figures", recursive = TRUE, showWarnings = FALSE)
+```
+
+# Project Overview
+
+This project applies ten forecasting methods to the **Number of Trips** variable from the TÜİK quarterly domestic tourism series. The aim is to compare how well each method captures the historical pattern and to produce a point forecast for 2026 Q1, which was not yet published at the time of data access.
+
+# Data Source and TÜİK Connection
+
+The data come from TÜİK's quarterly domestic tourism table, accessed entirely within R. The table belongs to the `istab` node type and does not carry a `TR,DF_...` dataflow ID, so it cannot be retrieved via the standard dataflow route. Instead, `tuikr::statistical_tables(theme = "14")` is used to locate the table and extract its official `table_url`, which is then fetched directly with `httr::GET()`.
+
+```{r import-data}
+data_import <- import_domestic_tourism_data()
+selected_table <- data_import$selected_table
+data_access_date <- data_import$data_access_date
+domestic_data <- data_import$data
+
+selected_table %>%
+  select(theme_name, theme_id, table_name, node_type, dataflow_id, table_url) %>%
+  kable()
+```
+
+Important data source information:
+
+```{r data-source-summary}
+latest_row <- domestic_data[nrow(domestic_data), ]
+forecast_results_preview <- NULL
+
+source_summary <- data.frame(
+  Field = c(
+    "TÜİK data set name",
+    "TÜİK theme/category",
+    "TÜİK table name",
+    "tuikr dataflow ID",
+    "Selected variable",
+    "Data frequency",
+    "Time coverage",
+    "Latest available observation",
+    "Forecast target period",
+    "Date of data access",
+    "R package used for data access"
+  ),
+  Value = c(
+    "Number of Trips and Overnights of Domestic Visitors by Quarter",
+    "Tourism",
+    "Number of Trips and Overnights of Domestic Visitors by Quarter",
+    "NA - istab table accessed via tuikr::statistical_tables(theme = \"14\")",
+    "Number of Trips",
+    "Quarterly",
+    paste0(domestic_data$Period[1], "-", domestic_data$Period[nrow(domestic_data)]),
+    domestic_data$Period[nrow(domestic_data)],
+    "2026 Q1",
+    as.character(data_access_date),
+    "tuikr"
+  )
+)
+
+kable(source_summary)
+```
+
+# Use of TÜİK Data in R
+
+No data file was manually downloaded, saved, or edited at any point. The full pipeline runs inside R:
+
+1. `tuikr::statistical_tables(theme = "14")` retrieves the list of Tourism tables.
+2. The row matching **Number of Trips and Overnights of Domestic Visitors by Quarter** is selected.
+3. The official `table_url` is fetched with `httr::GET()`.
+4. The returned Excel file is read with `readxl::read_excel()`.
+5. Quarterly rows are identified by their Roman numeral quarter labels (I–IV) and assembled into a clean time series.
+
+```{r data-preview}
+head(domestic_data) %>% kable()
+tail(domestic_data) %>% kable()
+```
+
+The selected series has `r nrow(domestic_data)` quarterly observations from `r domestic_data$Period[1]` to `r domestic_data$Period[nrow(domestic_data)]`. The latest available observation is `r domestic_data$Period[nrow(domestic_data)]`, and the forecast target period is **2026 Q1**.
+
+# Exploratory Time Series Analysis
+
+```{r actual-series}
+ts_trips <- ts(domestic_data$Trips, start = c(min(domestic_data$Year), 1), frequency = 4)
+
+actual_plot <- ggplot(domestic_data, aes(x = Time_Index, y = Trips)) +
+  geom_line(linewidth = 0.8) +
+  scale_x_continuous(
+    breaks = domestic_data$Time_Index[seq(1, nrow(domestic_data), by = 4)],
+    labels = domestic_data$Period[seq(1, nrow(domestic_data), by = 4)]
+  ) +
+  scale_y_continuous(labels = comma) +
+  labs(
+    title = "Actual Series: Domestic Visitors' Number of Trips",
+    x = "Period",
+    y = "Number of trips"
+  ) +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+
+actual_plot
+
+ggsave("outputs/figures/actual_series_plot.png", actual_plot, width = 9, height = 5, dpi = 300)
+```
+
+The series runs from 2009 Q1 through 2025 Q4 and has a pronounced seasonal cycle. Q3 is consistently the peak quarter — summer travel dominates domestic tourism in Türkiye — while Q1 records the lowest values. The overall level grew steadily through the 2010s before collapsing sharply in 2020 and recovering from 2022 onward. This pandemic break is the most significant feature of the series and complicates any method that relies on long-run averages or a single fitted trend.
+
+# Forecasting Methods
+
+```{r run-forecasting}
+forecast_results <- run_forecasting_methods(domestic_data)
+model_data <- forecast_results$data_with_fits
+next_forecasts <- forecast_results$next_forecasts
+target_period <- forecast_results$target_period
+```
+
+## Naïve Forecasting
+
+Naïve forecasting uses the previous period's actual value as the forecast for the current period.
+
+```{r naive}
+next_forecasts %>% filter(Method == "Naive Forecasting") %>% kable()
+
+save_actual_forecast_plot(
+  model_data %>% transmute(Time_Index, Period, Actual = Trips, Forecast = Naive),
+  "Actual vs Naive Forecast",
+  "outputs/figures/naive_forecast_plot.png"
+)
+```
+
+## Moving Average
+
+A four-quarter moving average is used to match one full seasonal cycle. Using fewer quarters would mix observations from different seasonal positions; using more would dilute recent levels.
+
+```{r moving-average}
+next_forecasts %>% filter(Method == "Moving Average") %>% kable()
+
+save_actual_forecast_plot(
+  model_data %>% transmute(Time_Index, Period, Actual = Trips, Forecast = Moving_Average),
+  "Actual vs Moving Average Forecast",
+  "outputs/figures/moving_average_plot.png"
+)
+```
+
+## Weighted Moving Average
+
+The weighted moving average assigns heavier weight to the most recent quarter (0.40) and progressively less to earlier ones (0.30, 0.20, 0.10), on the assumption that recent observations are more informative about the current level.
+
+```{r weighted-moving-average}
+next_forecasts %>% filter(Method == "Weighted Moving Average") %>% kable()
+
+save_actual_forecast_plot(
+  model_data %>% transmute(Time_Index, Period, Actual = Trips, Forecast = Weighted_Moving_Average),
+  "Actual vs Weighted Moving Average Forecast",
+  "outputs/figures/weighted_moving_average_plot.png"
+)
+```
+
+## Exponential Smoothing
+
+Simple exponential smoothing is included as a non-seasonal baseline. It adapts to level changes but ignores both trend and seasonality, so it is expected to underperform the decomposition methods on this series.
+
+```{r exponential-smoothing}
+summary(forecast_results$ses_fit)
+next_forecasts %>% filter(Method == "Exponential Smoothing") %>% kable()
+
+save_actual_forecast_plot(
+  model_data %>% transmute(Time_Index, Period, Actual = Trips, Forecast = Exponential_Smoothing),
+  "Actual vs Exponential Smoothing Forecast",
+  "outputs/figures/exponential_smoothing_plot.png"
+)
+```
+
+## Trend-Adjusted Exponential Smoothing
+
+Holt's method extends simple smoothing by also tracking a trend component. Given the upward drift visible in the pre-pandemic portion of the series, this extension is worth including, though the pandemic break makes a single estimated trend unreliable over the full sample.
+
+```{r holt}
+summary(forecast_results$holt_fit)
+next_forecasts %>% filter(Method == "Trend-Adjusted Exponential Smoothing") %>% kable()
+
+save_actual_forecast_plot(
+  model_data %>% transmute(Time_Index, Period, Actual = Trips, Forecast = Trend_Adjusted_Exponential_Smoothing),
+  "Actual vs Trend-Adjusted Exponential Smoothing Forecast",
+  "outputs/figures/trend_adjusted_smoothing_plot.png"
+)
+```
+
+## Linear Trend Projection
+
+A linear trend is fitted using a sequential time index. This is the simplest parametric trend model and serves as a reference point for the more flexible seasonal methods below.
+
+```{r linear-trend}
+summary(forecast_results$trend_model)
+next_forecasts %>% filter(Method == "Linear Trend Projection") %>% kable()
+
+save_actual_forecast_plot(
+  model_data %>% transmute(Time_Index, Period, Actual = Trips, Forecast = Linear_Trend_Projection),
+  "Actual vs Linear Trend Projection",
+  "outputs/figures/trend_projection_plot.png"
+)
+```
+
+# Seasonal Methods and Decomposition
+
+The quarterly structure of the series makes seasonal methods directly applicable. The four quarters map onto a clear recurring cycle, so methods that explicitly model the seasonal component should outperform those that ignore it.
+
+## Seasonal Indices
+
+```{r seasonal-indices}
+forecast_results$seasonal_index_table %>% kable(digits = 3)
+next_forecasts %>% filter(Method == "Seasonal Indices") %>% kable()
+
+save_actual_forecast_plot(
+  model_data %>% transmute(Time_Index, Period, Actual = Trips, Forecast = Seasonal_Indices),
+  "Actual vs Seasonal Indices Forecast",
+  "outputs/figures/seasonal_indices_plot.png"
+)
+```
+
+## Additive Decomposition
+
+```{r additive-decomposition}
+additive_components <- data.frame(
+  Time_Index = rep(model_data$Time_Index, 3),
+  Period = rep(model_data$Period, 3),
+  Component = rep(c("Trend", "Seasonal", "Random"), each = nrow(model_data)),
+  Value = c(
+    as.numeric(forecast_results$additive_decomp$trend),
+    as.numeric(forecast_results$additive_decomp$seasonal),
+    as.numeric(forecast_results$additive_decomp$random)
+  )
+)
+
+save_component_plot(additive_components, "Additive Decomposition Components", "outputs/figures/additive_decomposition_plot.png")
+next_forecasts %>% filter(Method == "Additive Decomposition") %>% kable()
+```
+
+## Multiplicative Decomposition
+
+```{r multiplicative-decomposition}
+multiplicative_components <- data.frame(
+  Time_Index = rep(model_data$Time_Index, 3),
+  Period = rep(model_data$Period, 3),
+  Component = rep(c("Trend", "Seasonal", "Random"), each = nrow(model_data)),
+  Value = c(
+    as.numeric(forecast_results$multiplicative_decomp$trend),
+    as.numeric(forecast_results$multiplicative_decomp$seasonal),
+    as.numeric(forecast_results$multiplicative_decomp$random)
+  )
+)
+
+save_component_plot(multiplicative_components, "Multiplicative Decomposition Components", "outputs/figures/multiplicative_decomposition_plot.png")
+next_forecasts %>% filter(Method == "Multiplicative Decomposition") %>% kable()
+```
+
+## Regression with Trend and Seasonal Dummy Variables
+
+```{r seasonal-dummy-regression}
+summary(forecast_results$seasonal_dummy_model)
+next_forecasts %>% filter(Method == "Regression with Trend and Seasonal Dummies") %>% kable()
+
+save_actual_forecast_plot(
+  model_data %>% transmute(Time_Index, Period, Actual = Trips, Forecast = Regression_Trend_Seasonal_Dummies),
+  "Actual vs Regression with Trend and Seasonal Dummies",
+  "outputs/figures/regression_seasonal_dummy_plot.png"
+)
+```
+
+# Forecast Accuracy Comparison
+
+Each method's fitted values are compared against the actual series using six measures. Bias and RSFE indicate whether errors are systematically positive or negative. MAD and MSE penalise large errors (MSE more heavily). MAPE expresses average error as a percentage of the actual value, making it easier to compare across methods. The Tracking Signal flags whether cumulative errors are drifting in one direction.
+
+```{r accuracy-comparison}
+method_columns <- c(
+  "Naive Forecasting" = "Naive",
+  "Moving Average" = "Moving_Average",
+  "Weighted Moving Average" = "Weighted_Moving_Average",
+  "Exponential Smoothing" = "Exponential_Smoothing",
+  "Trend-Adjusted Exponential Smoothing" = "Trend_Adjusted_Exponential_Smoothing",
+  "Linear Trend Projection" = "Linear_Trend_Projection",
+  "Seasonal Indices" = "Seasonal_Indices",
+  "Additive Decomposition" = "Additive_Decomposition",
+  "Multiplicative Decomposition" = "Multiplicative_Decomposition",
+  "Regression with Trend and Seasonal Dummies" = "Regression_Trend_Seasonal_Dummies"
+)
+
+accuracy_table <- lapply(names(method_columns), function(method_name) {
+  forecast_col <- method_columns[[method_name]]
+  metrics <- accuracy_measures(model_data$Trips, model_data[[forecast_col]])
+  next_value <- next_forecasts$Next_Period_Forecast[next_forecasts$Method == method_name]
+  data.frame(Method = method_name, metrics, Next_Period_Forecast = next_value)
+}) %>% bind_rows()
+
+write.csv(accuracy_table, "outputs/tables/accuracy_comparison.csv", row.names = FALSE)
+accuracy_table %>% kable(digits = 2)
+```
+
+# Superior Method Selection
+
+The primary selection criterion is MAPE, which is scale-independent and easy to interpret. Methods with non-finite MAPE or Tracking Signal values are excluded. Among the remaining candidates, the method with the lowest MAPE is selected; the Tracking Signal is used as a secondary check for systematic bias.
+
+The accuracy table confirms that the four seasonal methods outperform all non-seasonal ones by a wide margin. Additive Decomposition achieves the lowest MAPE at 9.49%, narrowly ahead of Multiplicative Decomposition at 9.89%. The additive specification is preferred here because the seasonal swings in the series do not appear to scale proportionally with the trend level — the amplitude of the seasonal pattern remains roughly stable over time rather than widening as the series grows.
+
+```{r superior-method}
+applicable_methods <- accuracy_table %>%
+  filter(is.finite(MAPE), is.finite(Tracking_Signal)) %>%
+  mutate(abs_tracking_signal = abs(Tracking_Signal))
+
+superior <- applicable_methods %>%
+  arrange(MAPE, abs_tracking_signal) %>%
+  slice(1)
+
+superior %>% kable(digits = 2)
+```
+
+The Tracking Signal of 0.57 is well within the ±4 control limit, which means the method is not producing systematic over- or under-forecasts.
+
+# Final Next-Period Forecast
+
+```{r final-forecast}
+final_forecast <- data.frame(
+  Selected_Superior_Method = superior$Method,
+  Data_Access_Date = as.character(data_access_date),
+  Latest_Available_Observation = domestic_data$Period[nrow(domestic_data)],
+  Forecast_Target_Period = target_period,
+  Forecasted_Value = superior$Next_Period_Forecast,
+  MAPE = superior$MAPE,
+  MAD = superior$MAD,
+  MSE = superior$MSE,
+  Tracking_Signal = superior$Tracking_Signal
+)
+
+write.csv(final_forecast, "outputs/tables/final_forecast.csv", row.names = FALSE)
+final_forecast %>% kable(digits = 2)
+
+superior_col <- method_columns[[superior$Method]]
+future_point <- data.frame(
+  Time_Index = max(model_data$Time_Index) + 1,
+  Period = target_period,
+  Actual = NA_real_,
+  Forecast = superior$Next_Period_Forecast
+)
+
+superior_plot_data <- bind_rows(
+  model_data %>% transmute(Time_Index, Period, Actual = Trips, Forecast = .data[[superior_col]]),
+  future_point
+)
+
+p_superior <- ggplot(superior_plot_data, aes(x = Time_Index)) +
+  geom_line(aes(y = Actual, linetype = "Actual"), linewidth = 0.8, na.rm = TRUE) +
+  geom_line(aes(y = Forecast, linetype = "Fitted/Forecast"), linewidth = 0.8, na.rm = TRUE) +
+  geom_point(data = future_point, aes(y = Forecast), size = 3, na.rm = TRUE) +
+  scale_x_continuous(
+    breaks = superior_plot_data$Time_Index[seq(1, nrow(superior_plot_data), by = 4)],
+    labels = superior_plot_data$Period[seq(1, nrow(superior_plot_data), by = 4)]
+  ) +
+  scale_y_continuous(labels = comma) +
+  labs(title = paste("Superior Method and", target_period, "Forecast"), x = "Period", y = "Number of trips", linetype = "Series") +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+
+p_superior
+ggsave("outputs/figures/superior_method_plot.png", p_superior, width = 9, height = 5, dpi = 300)
+```
+
+# Interpretation of Results
+
+The Additive Decomposition forecast places 2026 Q1 trips at approximately **11,603**. This is broadly consistent with historical Q1 values following the post-pandemic recovery: the series returned to near pre-pandemic Q1 levels by 2023–2024, and the forecast implies a continuation of that range rather than a sharp departure.
+
+The estimate should be read as a purely statistical projection based on the historical TÜİK series. It does not reflect any information about booking trends, macroeconomic conditions, transport costs, or policy changes that may affect actual Q1 2026 outcomes.
+
+# Limitations
+
+All ten methods are univariate — they extrapolate from the past values of this single series and cannot anticipate external shocks. The most consequential limitation is the 2020–2021 structural break: any method fitted over the full sample has to reconcile two very different regimes, which inflates in-sample errors and makes the estimated seasonal pattern less reliable. A rolling-window or post-2022 estimation might reduce this problem but would sacrifice most of the available data. Additionally, TÜİK may revise earlier observations in future releases, which would alter the accuracy measures retrospectively.
+
+# Reproducibility Notes
+
+1. Install the R packages listed in the setup chunk.
+2. Open `forecasting_project.Rmd` and knit to HTML.
+3. The script will fetch the TÜİK table directly from the official URL — no external data file is needed.
+
+The `renv.lock` file records the exact package versions used, so `renv::restore()` can be used to recreate the same library state.
